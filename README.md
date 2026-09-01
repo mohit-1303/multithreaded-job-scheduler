@@ -1,130 +1,93 @@
-# TaskFlow
+# TaskFlow — C++ Job Scheduling System
 
-**TaskFlow** is a modern C++17 multi-threaded job scheduling engine featuring pluggable scheduling algorithms, explicit state machine lifecycle tracking, automatic retry policies with transient/permanent error classification, and graceful thread pool draining.
+A multithreaded job scheduler in modern C++, built to demonstrate core systems
+and OOP fundamentals: state machines, the Strategy pattern, thread-safe
+producer/consumer synchronization, and RAII-based resource ownership.
 
----
+## What it does
 
-## Architecture Overview
+Jobs are submitted to a `Scheduler`, which hands them to a pool of worker
+threads according to a pluggable scheduling policy (Priority, FCFS, or Round
+Robin). Failed jobs are retried automatically if their failure was
+classified as transient; permanent failures terminate immediately.
 
-```
-                          ┌───────────────────────┐
-                          │    Scheduler::submit  │
-                          └──────────┬────────────┘
-                                     │
-                                     ▼
-                          ┌───────────────────────┐
-                          │  SchedulingStrategy   │
-                          │ (Priority/FCFS/RR)    │
-                          └──────────┬────────────┘
-                                     │
-                                     ▼
-                ┌────────────────────┴────────────────────┐
-                │             Worker Thread Pool          │
-                │                                         │
-                │   [Worker 1]    [Worker 2]   [Worker 3] │
-                └────────┬────────────┬───────────┬───────┘
-                         │            │           │
-                         ▼            ▼           ▼
-                      Job::run() (Executed outside lock)
-                                      │
-            ┌─────────────────────────┼─────────────────────────┐
-            │                         │                         │
-            ▼                         ▼                         ▼
-       [Success]              [TransientError]           [PermanentError]
-      COMPLETED                 Retry budget?                 FAILED
-                              ┌───────┴───────┐
-                              ▼               ▼
-                          RETRYING          FAILED
-                      (Requeued to Strat)
-```
-
----
-
-## Core Components
-
-### 1. Job State Machine & Lifecycle (`Job.h`, `Job.cpp`)
-Every job progresses through an explicit, validated state transition model:
-- `PENDING` $\to$ `RUNNING`
-- `RUNNING` $\to$ `COMPLETED` | `RETRYING` | `FAILED`
-- `RETRYING` $\to$ `RUNNING` | `FAILED`
-- Terminal states: `COMPLETED`, `FAILED`
-
-Transitions are validated against illegal mutations via `transitionTo()`.
-
-### 2. Error Classification & Retry Policy (`JobErrors.h`)
-- **`TransientError`**: Represents temporary issues (network timeout, lock contention, temporary resource exhaustion). Jobs failing with a transient error increment their retry count and transition to `RETRYING` as long as `retryCount <= maxRetries`.
-- **`PermanentError`** (and standard exceptions): Represents unrecoverable failures (invalid input, schema mismatch, logic error). Jobs fail immediately without consuming retry attempts.
-
-### 3. Pluggable Scheduling Strategies (`SchedulingStrategy.h`)
-- **`PriorityStrategy`**: Max-heap (`std::priority_queue`) prioritizing jobs with highest numeric priority value. Requeued jobs preserve their original priority.
-- **`FCFSStrategy`**: FIFO order using `std::deque`. Requeued retry jobs jump to the front (`push_front`) to avoid starvation after already waiting once.
-- **`RoundRobinStrategy`**: Fair-share scheduling grouped by `groupId` (e.g., client/tenant ID) to prevent high-volume clients from starving low-volume clients.
-
-### 4. Concurrency & Synchronization (`Scheduler.h`, `Scheduler.cpp`)
-- **Fine-Grained Locking**: Locks (`std::mutex`) are held strictly for queue management and state inspection. `job->run()` is executed **outside the lock**, enabling true multi-core parallel job execution.
-- **Condition Variable Coordination**: `std::condition_variable cv_` coordinates worker sleep/wakeups on submissions, requeues, and shutdowns.
-- **Graceful Shutdown**: `shutdown()` transitions the scheduler to stopping state and drains any remaining jobs in the strategy queues before worker threads join.
-
----
-
-## Project Structure
+## Architecture
 
 ```
-TaskFlow/
-├── CMakeLists.txt
-├── .gitignore
-├── README.md
-├── include/
-│   ├── Job.h
-│   ├── JobErrors.h
-│   ├── SchedulingStrategy.h
-│   └── Scheduler.h
-├── src/
-│   ├── Job.cpp
-│   ├── Scheduler.cpp
-│   └── main.cpp
-└── tests/
-    └── test_job.cpp
+Job              — owns its state machine and retry policy
+SchedulingStrategy — interface; Priority/FCFS/RoundRobin implementations
+Scheduler        — owns the thread pool, mutex/condvar synchronization,
+                    and delegates ordering decisions to a SchedulingStrategy
+JobErrors        — TransientError / PermanentError hierarchy
 ```
 
----
+## Design decisions
 
-## Building and Running
+**Strategy pattern for scheduling algorithms.**
+`Scheduler` doesn't know or care whether it's running Priority, FCFS, or
+Round Robin — it only calls `addJob` / `nextJob` / `requeueJob` on whatever
+`SchedulingStrategy` it was given. This keeps `Scheduler` (thread management,
+synchronization) fully decoupled from ordering policy, and means adding a new
+scheduling algorithm never touches `Scheduler` at all.
 
-### Prerequisites
-- CMake 3.10+
-- C++17 compatible compiler (GCC, Clang, or MSVC)
-- POSIX / Win32 Threads support
+**Explicit state machine, not an implicit enum.**
+Every legal transition is enumerated in `Job::isLegalTransition`, and illegal
+transitions trip an assertion rather than silently corrupting state. This
+was deliberate: a job going `COMPLETED → RUNNING` should be impossible by
+construction, not just "shouldn't happen in practice."
 
-### Build Commands
+**Round Robin fairness without preemption.**
+Jobs run atomically to completion — `std::function<void()>` has no natural
+way to pause and resume mid-execution, and safely interrupting arbitrary
+running code isn't something C++ threads support. So Round Robin here means
+fair *ordering* across job groups (no single group can starve another), not
+true time-sliced preemption of a running job. This is a conscious scope
+decision: true preemptive scheduling would require jobs to expose resumable,
+chunked work, which is a materially bigger feature than this project needs.
+
+**Two-tier exception hierarchy for retry classification.**
+`TransientError` (environmental, retry might help) vs. `PermanentError`
+(the task itself is wrong, retrying won't fix it) lets `Job::run()` decide
+retry eligibility by `catch` type rather than inspecting error messages or
+codes. Anything not explicitly classified (`std::bad_alloc`, unexpected
+`std::exception`s) is treated as permanent by default — an error the system
+didn't anticipate shouldn't be assumed safe to retry.
+
+**Retried jobs get front-of-queue priority.**
+A job that already waited once and failed transiently shouldn't lose its
+place to brand-new arrivals. For `PriorityStrategy` this is automatic
+(priority already governs order); for `FCFSStrategy` and `RoundRobinStrategy`
+it's implemented explicitly via `requeueJob`.
+
+**Job execution happens outside the scheduler's lock.**
+`workerLoop` releases `mtx_` before calling `job->run()` and only
+re-acquires it to check the result and requeue if needed. Holding the lock
+during job execution would serialize all workers behind whichever one is
+currently running a job, defeating the purpose of a thread pool.
+
+**Smart pointers reflect actual ownership.**
+`shared_ptr<Job>` — both the strategy's internal queue and `Scheduler`'s
+`jobsById_` map hold references to the same job simultaneously, so shared
+ownership is correct, not just convenient. `unique_ptr<SchedulingStrategy>`
+— exactly one `Scheduler` owns its strategy for its whole lifetime.
+
+## What's intentionally out of scope
+
+This project targets interview-level demonstration of fundamentals, not
+production readiness. Explicitly not included:
+- Retry backoff/delay (immediate retry with a count cap only)
+- Persistence — jobs are in-memory only
+- Logging/metrics infrastructure
+- Preemptive scheduling (see Round Robin note above)
+
+## Build & run
+
 ```bash
 mkdir build && cd build
 cmake ..
-cmake --build .
+make
+./taskflow
+./taskflow_tests
 ```
 
-### Run Demo
-```bash
-./taskflow       # On Windows: .\taskflow.exe or .\Debug\taskflow.exe
-```
-
-### Run Unit Tests
-```bash
-./taskflow_tests # On Windows: .\taskflow_tests.exe or .\Debug\taskflow_tests.exe
-```
-
----
-
-## Design Decisions & Deep Dive
-
-### Why execute `job->run()` outside the mutex lock?
-Holding the scheduler mutex while executing user tasks would serialize execution, degrading an $N$-worker thread pool into single-threaded execution. By releasing `mtx_` prior to `job->run()` and only re-acquiring it during result inspection and requeuing, worker threads achieve full parallelism.
-
-### Why separate `start()` from the constructor?
-Separating thread instantiation from object construction prevents race conditions where worker threads begin polling and accessing partially constructed member state before construction completes.
-
-### Why distinguish `addJob()` and `requeueJob()`?
-Different scheduling strategies handle retries differently:
-- In **FCFS**, retried jobs should jump to the front of the queue because they have already spent time waiting and should not be penalized by new arrivals.
-- In **Priority**, retried jobs re-enter at their configured priority rank.
-- In **RoundRobin**, retried jobs get placed at the front of their group queue.
+Requires a C++17 compiler and CMake ≥ 3.10.
