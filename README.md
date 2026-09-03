@@ -71,14 +71,6 @@ currently running a job, defeating the purpose of a thread pool.
 ownership is correct, not just convenient. `unique_ptr<SchedulingStrategy>`
 — exactly one `Scheduler` owns its strategy for its whole lifetime.
 
-## What's intentionally out of scope
-
-This project targets interview-level demonstration of fundamentals, not
-production readiness. Explicitly not included:
-- Retry backoff/delay (immediate retry with a count cap only)
-- Persistence — jobs are in-memory only
-- Logging/metrics infrastructure
-- Preemptive scheduling (see Round Robin note above)
 
 ## Build & run
 
